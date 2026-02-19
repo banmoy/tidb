@@ -743,3 +743,350 @@ coprocessor.Request → gRPC → TiKV
 | `pkg/kv/mpp.go` | MPP 相关接口定义 |
 | `pkg/store/copr/mpp.go` | MPP 客户端实现 |
 | `client-go/.../region_cache.go` | Region Cache 核心：BatchLocateKeyRanges、LocateKey |
+| `client-go/.../region_request.go` | Region 请求发送与 Region 错误重试 |
+
+---
+
+## Region 分裂合并过程中如何确保数据一致性
+
+Region 分裂（Split）和合并（Merge）是 TiKV 自动维护数据分布的核心机制。在这些操作进行期间和完成之后，TiDB 客户端可能持有过期的 Region 信息，因此需要一套完整的机制来保证查询的正确性和一致性。
+
+### 核心保障机制概览
+
+```
+                      TiKV 侧                        TiDB 侧
+              ┌─────────────────────┐        ┌──────────────────────┐
+              │  1. Raft 协议保证    │        │  3. Region Epoch     │
+              │     原子性           │        │     版本检测          │
+              ├─────────────────────┤        ├──────────────────────┤
+              │  2. Region Epoch    │───────▶│  4. Region Error     │
+              │     版本递增         │        │     自动重试          │
+              ├─────────────────────┤        ├──────────────────────┤
+              │  5. 分裂/合并期间    │        │  6. Region Cache     │
+              │     读写阻塞         │        │     失效与刷新        │
+              └─────────────────────┘        └──────────────────────┘
+```
+
+### 1. Region Epoch：分裂合并的版本号机制
+
+每个 Region 都有一个 **RegionEpoch**，它是保证一致性的关键：
+
+```go
+// kvproto/pkg/metapb/metapb.pb.go
+type RegionEpoch struct {
+    // ConfVer: 当 Region 的 Peer 成员变更时自增（Add/Remove Peer）
+    ConfVer uint64
+    // Version: 当 Region 分裂或合并时自增
+    Version uint64
+}
+```
+
+**版本变化规则**：
+
+| 操作 | ConfVer | Version |
+|------|---------|---------|
+| Region Split | 不变 | +1（原 Region 和新 Region 都递增） |
+| Region Merge | 不变 | +1（合并后的目标 Region 递增） |
+| Add Peer | +1 | 不变 |
+| Remove Peer | +1 | 不变 |
+
+TiDB 在发送每个 RPC 请求时都会携带它所知道的 `RegionEpoch`（包含在 `RegionVerID` 中）。TiKV 收到请求后会将携带的 epoch 与自身当前的 epoch 进行比较。
+
+### 2. TiKV 侧：Raft 保证分裂/合并的原子性
+
+**Region Split 过程**（以分裂为两个 Region 为例）：
+
+```
+原 Region [a, z), Epoch{ConfVer=1, Version=1}
+   │
+   │  1. PD 调度或 TiKV 自主触发 Split
+   │
+   ▼
+Leader 提出 Split Raft 日志
+   │
+   │  2. Raft 共识：所有 Peer 都 Apply 这条 Split 日志
+   │     这是原子的——要么全部 Peer 都分裂，要么都不分裂
+   │
+   ▼
+Apply Split:
+   ├── Region 1 [a, m), Epoch{ConfVer=1, Version=2}  ← Version 递增
+   └── Region 2 [m, z), Epoch{ConfVer=1, Version=2}  ← 新 Region
+```
+
+关键点：
+- Split 是通过 **Raft 日志** 传播的，所有副本原子地执行分裂操作
+- 分裂前所有进行中的 Raft 日志必须先 Apply 完成
+- 分裂后，原 Region 的 Key 范围缩小，新 Region 获得后半段数据（数据已在本地，只是修改 Region 元数据）
+
+**Region Merge 过程**：
+
+```
+Region A [a, m), Epoch{ConfVer=1, Version=2}  ← source
+Region B [m, z), Epoch{ConfVer=1, Version=2}  ← target
+   │
+   │  1. PD 调度 Merge
+   │
+   ▼
+PrepareMerge (在 source Region A 上):
+   │  - 通过 Raft 提案，阻止 source 接受新的写入
+   │  - 等待所有进行中的 Raft 日志 Apply 完成
+   │
+   ▼
+CommitMerge (在 target Region B 上):
+   │  - 通过 Raft 提案，原子地将 source 的数据并入 target
+   │  - Target Region B 的 Version 递增
+   │
+   ▼
+结果: Region B [a, z), Epoch{ConfVer=1, Version=3}
+       Region A 被销毁
+```
+
+关键点：
+- Merge 分为 `PrepareMerge` 和 `CommitMerge` 两个阶段
+- `PrepareMerge` 期间 source Region 拒绝新的写入（返回 `ProposalInMergingMode` 错误）
+- 读请求可能收到 `ReadIndexNotReady` 错误
+- 整个过程通过 Raft 保证原子性
+
+### 3. TiDB 侧：Region Error 检测与重试
+
+当 Region 发生分裂或合并后，TiDB 持有的 Region 信息可能过期。TiKV 通过返回 **Region Error** 来通知客户端。client-go 的 `RegionRequestSender.onRegionError()` 处理所有类型的 Region 错误：
+
+#### EpochNotMatch（最常见的分裂/合并错误）
+
+当 TiDB 携带的 RegionEpoch 与 TiKV 当前的不匹配时触发：
+
+```go
+// client-go/internal/locate/region_request.go
+if epochNotMatch := regionErr.GetEpochNotMatch(); epochNotMatch != nil {
+    // TiKV 在 EpochNotMatch 错误中附带了当前的 Region 信息
+    // （可能是分裂后的多个 Region）
+    retry, err := s.regionCache.OnRegionEpochNotMatch(
+        bo, ctx, epochNotMatch.CurrentRegions)
+    return retry, err
+}
+```
+
+`OnRegionEpochNotMatch` 的处理逻辑：
+
+```go
+// client-go/internal/locate/region_cache.go
+func (c *RegionCache) OnRegionEpochNotMatch(bo, ctx, currentRegions) {
+    // 1. 检查是否是 TiDB 的 epoch 超前于 TiKV（异常情况）
+    //    如果是，说明缓存可能不一致，需要 backoff 重试
+    for _, meta := range currentRegions {
+        if meta.GetId() == ctx.Region.id &&
+           meta.Epoch.Version < ctx.Region.ver {
+            return true, bo.Backoff(...)  // 退避重试
+        }
+    }
+
+    // 2. 用 TiKV 返回的最新 Region 信息更新本地缓存
+    for _, meta := range currentRegions {
+        region := newRegion(meta)
+        region.switchWorkLeaderToPeer(...)  // 设置 Leader
+        newRegions = append(newRegions, region)
+    }
+
+    // 3. 使旧的缓存条目失效
+    if needInvalidateOld {
+        cachedRegion.invalidate(EpochNotMatch)
+    }
+
+    // 4. 将新 Region 信息插入缓存
+    for _, region := range newRegions {
+        c.insertRegionToCache(region, true, true)
+    }
+
+    return false, nil  // 不直接重试，让上层用新缓存重建请求
+}
+```
+
+#### 分裂场景下 EpochNotMatch 的具体表现
+
+```
+TiDB 缓存: Region 1 [a, z), Epoch{Version=1}
+   │
+   │  TiDB 发送 Coprocessor 请求，扫描 [a, z)
+   │
+   ▼
+TiKV 发现 Region 已分裂:
+   Region 1 [a, m), Epoch{Version=2}
+   Region 2 [m, z), Epoch{Version=2}
+   │
+   │  返回 EpochNotMatch{
+   │      CurrentRegions: [Region1{[a,m)}, Region2{[m,z)}]
+   │  }
+   │
+   ▼
+TiDB client-go 处理:
+   1. 用 Region1, Region2 更新 Region Cache
+   2. 返回到 Coprocessor 层（handleCopResponse）
+   │
+   ▼
+Coprocessor 层 (handleCopResponse):
+   1. 收到 RegionError
+   2. Backoff（BoRegionMiss）
+   3. 用 task.ranges 重新调用 buildCopTasks
+   4. buildCopTasks 用更新后的 Region Cache 重新切分范围
+      → copTask 1: Region 1 [a, m), ranges = [a, m)
+      → copTask 2: Region 2 [m, z), ranges = [m, z)
+   5. 返回新 tasks 作为 remains，继续执行
+```
+
+#### 合并场景下的错误处理
+
+```
+TiDB 缓存: Region 1 [a, m) 和 Region 2 [m, z)
+   │
+   │  Region 已合并为 Region 2 [a, z)
+   │
+   ▼
+发送请求到旧的 Region 1 → 可能收到:
+   ├── RegionNotFound    ← Region 1 已不存在
+   │     → InvalidateCachedRegion(Region1)
+   │     → 上层重新 buildCopTasks，从 PD 刷新 Region 信息
+   │
+   ├── EpochNotMatch     ← 如果目标节点知道合并后的 Region
+   │     → 用 CurrentRegions 中的合并后 Region 更新缓存
+   │
+   └── KeyNotInRegion    ← Key 不再属于该 Region
+         → InvalidateCachedRegion
+         → 上层重建请求
+```
+
+### 4. 两层重试机制
+
+Region 分裂/合并的一致性保证通过**两层重试**实现：
+
+**第一层：client-go `SendReqCtx` 内部重试**
+
+```go
+// SendReqCtx 内部是一个 for 循环
+for !state.next() {
+    // next() 内部:
+    // 1. 从 Region Cache 获取 Region 地址
+    // 2. 发送 RPC
+    // 3. 如果收到 Region Error:
+    //    - NotLeader → 更新 Leader，重试
+    //    - StaleCommand → Backoff，重试
+    //    - ReadIndexNotReady → Backoff，重试（正在分裂/合并中）
+    //    - ProposalInMergingMode → Backoff，重试（正在合并中）
+    //    - EpochNotMatch → 更新缓存，返回给上层
+    //    - RegionNotFound → 失效缓存，返回给上层
+}
+```
+
+`SendReqCtx` 能处理的是：请求发到了正确的 Region 但 Leader 变化或暂时不可用的情况。它**不会**改变请求的 Key 范围。
+
+**第二层：Coprocessor `handleCopResponse` 重建任务**
+
+当第一层返回 `RegionError`（如 `EpochNotMatch`、`RegionNotFound`），Coprocessor 层需要**重新切分范围**：
+
+```go
+// pkg/store/copr/coprocessor.go - handleCopResponse
+if regionErr := getRegionError(resp); regionErr != nil {
+    // 1. Backoff
+    bo.Backoff(tikv.BoRegionMiss(), ...)
+
+    // 2. 用该 task 原始的 ranges 重新构建 copTasks
+    //    此时 Region Cache 已被第一层更新
+    remains, err := buildCopTasks(bo, task.ranges, &buildCopTaskOpt{
+        req:   worker.req,
+        cache: worker.store.GetRegionCache(),
+    })
+
+    // 3. 将新 tasks 返回为 remains，由 copIterator 继续调度
+    return &copTaskResult{remains: remains}, nil
+}
+```
+
+这层重试的关键是：使用**原始 Key 范围**重新调用 `buildCopTasks`，让 Region Cache 中的最新 Region 信息重新切分范围。这保证了：
+- 不会遗漏任何 Key 范围
+- 不会重复扫描已完成的范围（因为用的是失败 task 的 ranges，不是全局 ranges）
+
+### 5. 分裂/合并期间的读写阻塞
+
+TiKV 在分裂/合并的关键阶段会暂时阻塞读写请求：
+
+| 错误类型 | 触发条件 | TiDB 处理 |
+|---------|----------|----------|
+| `ReadIndexNotReady` | Region 正在分裂或合并，ReadIndex 无法处理 | `BoRegionScheduling` 退避重试 |
+| `ProposalInMergingMode` | Region 正在执行 Merge，拒绝写入 | `BoRegionScheduling` 退避重试 |
+| `RegionNotInitialized` | 新 Region 的 Peer 尚未初始化完成 | `BoMaxRegionNotInitialized` 退避重试 |
+| `DataIsNotReady` | Follower 的数据还没追上（Stale Read 场景） | 切换到 Leader 重试 |
+
+这些阻塞是**短暂的**（通常毫秒级），分裂/合并完成后自动恢复。
+
+### 6. MVCC 快照读的一致性保障
+
+即使 Region 发生分裂/合并，MVCC 快照读的一致性仍然得到保障：
+
+1. **start_ts 不变**：一个事务/查询的 `start_ts` 在整个执行期间不变，无论请求被重试多少次
+2. **Raft 保证线性一致性**：所有的分裂/合并操作都通过 Raft 日志序列化，有明确的时间戳顺序
+3. **MVCC 版本不受影响**：分裂/合并只是改变 Region 的 Key 范围和元数据，不会修改数据的 MVCC 版本
+
+```
+时间线:
+  t1: 事务开始, start_ts = 100
+  t2: Region Split 发生 (所有数据版本不变，只是 Region 边界变了)
+  t3: 事务读取 → 使用 start_ts=100 读取
+      即使请求因 EpochNotMatch 被重试，
+      重试后仍然使用 start_ts=100，
+      读到的 MVCC 数据是一致的
+```
+
+### 7. 完整的一致性保证链
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     一致性保证的完整链路                           │
+│                                                                  │
+│  TiKV 侧:                                                       │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │ Raft 共识 → Split/Merge 日志原子 Apply → Epoch 递增     │     │
+│  │                                                         │     │
+│  │ Split/Merge 期间:                                       │     │
+│  │  - 写请求被 ProposalInMergingMode 阻塞                  │     │
+│  │  - 读请求被 ReadIndexNotReady 阻塞                      │     │
+│  │  - 完成后返回 EpochNotMatch 给过期请求                   │     │
+│  └─────────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│                              ▼                                   │
+│  client-go 侧:                                                  │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │ SendReqCtx:                                              │     │
+│  │  - EpochNotMatch → 用 TiKV 返回的新 Region 更新缓存     │     │
+│  │  - RegionNotFound → 失效缓存                            │     │
+│  │  - ReadIndexNotReady/Merging → 退避重试                  │     │
+│  └─────────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│                              ▼                                   │
+│  Coprocessor 侧:                                                │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │ handleCopResponse:                                       │     │
+│  │  - 收到 RegionError → 用原始 ranges 重新 buildCopTasks  │     │
+│  │  - 新 tasks 使用更新后的 Region Cache                    │     │
+│  │  - 保证所有 Key 范围被完整覆盖                           │     │
+│  └─────────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│                              ▼                                   │
+│  MVCC 侧:                                                       │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │ start_ts 贯穿整个请求生命周期（包括重试）                │     │
+│  │ → 保证快照读的一致性不受 Region 变化影响                 │     │
+│  └─────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 核心源码索引（Region 分裂合并相关）
+
+| 文件 | 关键函数/类型 | 用途 |
+|------|-------------|------|
+| `kvproto/pkg/metapb/metapb.pb.go` | `RegionEpoch{ConfVer, Version}` | Region 版本号定义 |
+| `kvproto/pkg/errorpb/errorpb.pb.go` | `EpochNotMatch{CurrentRegions}` | 分裂/合并错误定义 |
+| `kvproto/pkg/errorpb/errorpb.pb.go` | `ProposalInMergingMode`, `ReadIndexNotReady` | 合并/分裂期间阻塞错误 |
+| `client-go/.../region_request.go` | `onRegionError()` | 所有 Region 错误的分发处理 |
+| `client-go/.../region_cache.go` | `OnRegionEpochNotMatch()` | EpochNotMatch 后更新缓存 |
+| `client-go/.../region_cache.go` | `InvalidateCachedRegion()` | 失效过期 Region 缓存 |
+| `pkg/store/copr/coprocessor.go` | `handleCopResponse()` | Coprocessor 层 Region 错误重试 |
+| `pkg/store/copr/coprocessor.go` | `buildCopTasks()` | 用最新 Region 信息重新切分范围 |
