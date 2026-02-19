@@ -747,6 +747,284 @@ coprocessor.Request → gRPC → TiKV
 
 ---
 
+## Region 元信息存储在哪里
+
+Region 元信息在三个层面存储和流转：**PD（权威源）**、**TiKV（本地持久化）**、**TiDB/client-go（内存缓存）**。
+
+### Region 元信息的数据结构
+
+```protobuf
+// kvproto/pkg/metapb — Region 元信息的 Protobuf 定义
+message Region {
+    uint64       id          = 1;   // Region 全局唯一 ID（PD 分配）
+    bytes        start_key   = 2;   // Region 负责的起始 Key（包含）
+    bytes        end_key     = 3;   // Region 负责的结束 Key（不包含，空=+∞）
+    RegionEpoch  region_epoch = 4;  // 版本号 {ConfVer, Version}
+    repeated Peer peers      = 5;   // 副本所在的 Store 列表
+}
+
+message RegionEpoch {
+    uint64 conf_ver = 1;  // 成员变更时递增
+    uint64 version  = 2;  // Split/Merge 时递增
+}
+
+message Peer {
+    uint64    id       = 1;  // Peer ID（PD 分配）
+    uint64    store_id = 2;  // 所在 TiKV Store 的 ID
+    PeerRole  role     = 3;  // Voter / Learner / Witness
+}
+```
+
+### 三层存储架构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          PD (权威源)                                │
+│                                                                     │
+│  存储位置: etcd (内嵌)                                              │
+│  数据结构: metapb.Region + Leader + 统计信息                        │
+│  更新方式: TiKV Leader 通过 RegionHeartbeat 上报                    │
+│  接口:     GetRegion / ScanRegions / BatchScanRegions               │
+│                                                                     │
+│  PD 内部按 Key 范围维护一棵 Region Tree，支持：                      │
+│   - 按 Key 查找所在 Region                                          │
+│   - 按范围扫描 Region 列表                                          │
+│   - 检测 Region overlap 和一致性                                    │
+└────────────────┬────────────────────────────────────────────────────┘
+                 │  RegionHeartbeat (上行)
+                 │  GetRegion / ScanRegions (下行)
+                 │
+┌────────────────┴────────────────────────────────────────────────────┐
+│                    TiKV (每个节点本地持久化)                         │
+│                                                                     │
+│  存储位置: RocksDB (Raft Engine) — REGION_STATE_KEY                 │
+│  数据结构: RegionLocalState {                                       │
+│      State:  PeerState (Normal / Applying / Tombstone / Merging)    │
+│      Region: metapb.Region (和 PD 中的相同)                         │
+│      MergeState: 合并进行中的状态                                   │
+│  }                                                                  │
+│                                                                     │
+│  更新时机:                                                          │
+│   - Raft Apply Split/Merge/ConfChange 日志后写入                    │
+│   - TiKV 重启时从本地加载，恢复 Region 信息                         │
+│                                                                     │
+│  Leader 职责:                                                       │
+│   - 定期向 PD 发送 RegionHeartbeat（携带 Region 元信息 +            │
+│     Leader 信息 + 统计数据）                                        │
+│   - 响应请求时校验 RegionEpoch，不匹配则返回 EpochNotMatch          │
+└────────────────┬────────────────────────────────────────────────────┘
+                 │  BatchScanRegions / GetRegion (gRPC)
+                 │  EpochNotMatch 错误返回 currentRegions
+                 │
+┌────────────────┴────────────────────────────────────────────────────┐
+│               TiDB / client-go (内存缓存)                           │
+│                                                                     │
+│  存储位置: RegionCache (内存)                                       │
+│  数据结构:                                                          │
+│    regionIndexMu {                                                  │
+│      regions:        map[RegionVerID]*Region  // ID+版本→Region     │
+│      latestVersions: map[uint64]RegionVerID   // ID→最新版本映射    │
+│      sorted:         *SortedRegions (B-tree)  // Key→Region 有序   │
+│    }                                                                │
+│                                                                     │
+│  Region 结构:                                                       │
+│    Region {                                                         │
+│      meta:  *metapb.Region      // 从 PD 获取的原始元信息           │
+│      store: *regionStore {      // 副本的 Store 信息               │
+│        stores:      []*Store    // 各 Peer 所在 Store 的连接信息    │
+│        accessIndex: [][]int     // TiKV/TiFlash 访问索引           │
+│        workTiKVIdx: AccessIndex // 当前 Leader 在 stores 中的位置   │
+│        buckets:     *Buckets    // Region 内部的 Bucket 信息       │
+│      }                                                              │
+│      ttl: int64                 // 缓存 TTL                        │
+│    }                                                                │
+│                                                                     │
+│  刷新方式:                                                          │
+│   1. 按需加载: 首次访问某 Key 范围时从 PD 获取                      │
+│   2. 错误驱动: 收到 EpochNotMatch 等错误后更新或失效                │
+│   3. 后台刷新: TTL 过期后异步从 PD 刷新                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### PD 中的存储
+
+PD 是 Region 元信息的**权威源（Source of Truth）**。
+
+**底层存储**：PD 使用内嵌的 **etcd** 持久化集群元数据。Region 信息同时维护在内存中的 Region Tree（按 Key 排序的树结构）中，供快速查询。
+
+**数据来源**：TiKV 的每个 Region Leader 定期（默认约 60 秒，变化时立即）向 PD 发送 `RegionHeartbeat`：
+
+```go
+// kvproto/pkg/pdpb — TiKV → PD 的心跳请求
+type RegionHeartbeatRequest struct {
+    Region          *metapb.Region  // Region 元信息（ID, Key范围, Epoch, Peers）
+    Leader          *metapb.Peer    // 当前 Leader 是哪个 Peer
+    DownPeers       []*PeerStats    // Leader 认为 down 的 Peer
+    PendingPeers    []*metapb.Peer  // 还在同步中的 Peer
+    ApproximateSize uint64          // Region 大小（近似，用于调度）
+    ApproximateKeys uint64          // Region Key 数量（近似）
+    BytesWritten    uint64          // 写入流量
+    BytesRead       uint64          // 读取流量
+    Term            uint64          // Raft Term
+}
+```
+
+**PD 提供的查询接口**（client-go 通过 `pd.Client` 调用）：
+
+| 接口 | 用途 |
+|------|------|
+| `GetRegion(key)` | 根据 Key 查找所在 Region |
+| `GetRegionByID(id)` | 根据 Region ID 查找 |
+| `ScanRegions(startKey, endKey, limit)` | 扫描一段 Key 范围内的所有 Region |
+| `BatchScanRegions(keyRanges, limit)` | 批量扫描多个 Key 范围的 Region |
+
+### TiKV 中的存储
+
+每个 TiKV 节点在本地持久化它所负责的 Region 的元信息。
+
+**存储位置**：写入 RocksDB（Raft Engine 的一部分），使用特定的 Key 前缀 `REGION_STATE_KEY`。
+
+**数据结构** — `RegionLocalState`：
+
+```go
+// kvproto/pkg/raft_serverpb
+type RegionLocalState struct {
+    State      PeerState       // Normal / Applying / Tombstone / Merging
+    Region     *metapb.Region  // Region 元信息（和 PD 中的相同结构）
+    MergeState *MergeState     // 合并进行中的状态
+}
+
+// PeerState 枚举
+const (
+    PeerState_Normal    = 0  // 正常服务
+    PeerState_Applying  = 1  // 正在 Apply Snapshot
+    PeerState_Tombstone = 2  // 已被销毁（Split/Merge 后的旧 Region）
+    PeerState_Merging   = 3  // 正在执行 Merge
+)
+```
+
+**更新时机**：
+- Raft Apply 产生 Region 变化的日志时（Split、Merge、ConfChange）
+- 收到 Snapshot 并 Apply 时
+- TiKV 重启时从本地读取，恢复所有 Region 的 Raft 状态机
+
+**TiKV 重启恢复流程**：
+```
+TiKV 启动
+  ├── 扫描 RocksDB 中所有 REGION_STATE_KEY
+  ├── 过滤掉 Tombstone 状态的 Region
+  ├── 对每个 Normal/Applying 状态的 Region:
+  │     ├── 恢复 Raft 状态机
+  │     ├── 恢复 Apply State
+  │     └── 开始 Raft tick
+  └── Leader 选举后向 PD 发送心跳
+```
+
+### TiDB 的 Region Cache
+
+TiDB（通过 client-go）在内存中维护 Region 元信息的缓存。
+
+**核心数据结构**：
+
+```go
+// client-go/internal/locate/region_cache.go
+type RegionCache struct {
+    pdClient pd.Client           // PD 客户端，用于查询 Region
+    mu       regionIndexMu       // Region 索引（加锁保护）
+    stores   storeCache          // Store 信息缓存
+}
+
+type regionIndexMu struct {
+    sync.RWMutex
+    regions        map[RegionVerID]*Region  // {ID, ConfVer, Ver} → Region 映射
+    latestVersions map[uint64]RegionVerID   // RegionID → 最新版本号
+    sorted         *SortedRegions           // B-tree，按 StartKey 排序
+}
+```
+
+**B-tree 索引**：`SortedRegions` 使用 B-tree（`btree.BTreeG`）按 Region 的 `StartKey` 排序存储，支持：
+- `O(log N)` 按 Key 查找所在 Region
+- `O(log N + M)` 范围扫描（M 为结果数）
+- 插入时自动检测和清理交叉 Region
+
+**缓存刷新策略**：
+
+| 触发条件 | 刷新方式 |
+|---------|---------|
+| 首次访问某 Key 范围 | `BatchLocateKeyRanges` → 先查缓存，缺失部分查 PD |
+| `EpochNotMatch` 错误 | TiKV 在错误中附带新 Region 信息，直接更新缓存 |
+| `RegionNotFound` / `KeyNotInRegion` | `InvalidateCachedRegion` 失效缓存，下次访问时重新从 PD 加载 |
+| `NotLeader` 错误 | 更新 Leader 信息（`UpdateLeader`），不失效整个 Region |
+| TTL 过期 | 后台 goroutine 异步标记需刷新，下次访问时触发 |
+| `StoreNotMatch` | 失效缓存，重新解析 Store 地址 |
+
+**插入时的一致性检查**：
+
+```go
+func (mu *regionIndexMu) insertRegionToCache(cachedRegion *Region, ...) bool {
+    newVer := cachedRegion.VerID()
+    oldVer, ok := mu.latestVersions[newVer.id]
+
+    // 拒绝过期的 Region（epoch 更旧的不覆盖更新的）
+    if ok && (oldVer.GetVer() > newVer.GetVer() ||
+              oldVer.GetConfVer() > newVer.GetConfVer()) {
+        return false  // 丢弃过期数据
+    }
+
+    // 删除 B-tree 中与新 Region Key 范围重叠的旧条目
+    mu.sorted.removeIntersecting(cachedRegion, newVer)
+
+    // 插入新 Region
+    mu.sorted.ReplaceOrInsert(cachedRegion)
+}
+```
+
+### 元信息流转全景
+
+```
+                    ┌─────────────┐
+                    │     PD      │
+                    │  (etcd 持久化)│
+                    │             │
+                    │ Region Tree │ ◄─── 权威源
+                    │ (按Key排序)  │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+      RegionHeartbeat  ScanRegions  GetRegion
+        (上报)          (查询)       (查询)
+              │            │            │
+    ┌─────────┴──┐    ┌────┴────┐  ┌───┴────┐
+    │   TiKV-1   │    │ TiKV-2  │  │ TiKV-3 │
+    │            │    │         │  │        │
+    │ RocksDB:   │    │ ...     │  │ ...    │
+    │ RegionLocal│    │         │  │        │
+    │ State      │    │         │  │        │
+    │ (持久化)    │    │         │  │        │
+    └────────────┘    └─────────┘  └────────┘
+              │
+     EpochNotMatch 错误
+     (附带最新 Region)
+              │
+    ┌─────────┴──────────┐
+    │    TiDB (client-go) │
+    │                     │
+    │  RegionCache:       │
+    │   B-tree (按Key)    │
+    │   Map (按ID+版本)   │
+    │   (内存缓存)        │ ◄─── 按需加载 + 错误驱动刷新
+    └─────────────────────┘
+```
+
+| 存储层 | 存储介质 | 持久性 | 数据新鲜度 | 用途 |
+|--------|---------|--------|-----------|------|
+| **PD** | etcd（磁盘） | 持久 | 最新（心跳驱动） | 权威源，调度决策 |
+| **TiKV** | RocksDB（磁盘） | 持久 | 实时（Raft Apply 时更新） | 重启恢复，请求校验 |
+| **TiDB** | 内存 B-tree | 非持久 | 近实时（按需刷新） | 请求路由，Key→Region 映射 |
+
+---
+
 ## Region 分裂合并过程中如何确保数据一致性
 
 Region 分裂（Split）和合并（Merge）是 TiKV 自动维护数据分布的核心机制。在这些操作进行期间和完成之后，TiDB 客户端可能持有过期的 Region 信息，因此需要一套完整的机制来保证查询的正确性和一致性。
